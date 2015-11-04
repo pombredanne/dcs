@@ -71,6 +71,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"syscall"
 )
 
 const (
@@ -80,6 +81,7 @@ const (
 
 // An Index implements read-only access to a trigram index.
 type Index struct {
+	File      string
 	Verbose   bool
 	data      mmapData
 	pathData  uint32
@@ -96,10 +98,11 @@ const postEntrySize = 3 + 4 + 4
 func Open(file string) *Index {
 	mm := mmap(file)
 	if len(mm.d) < 4*4+len(trailerMagic) || string(mm.d[len(mm.d)-len(trailerMagic):]) != trailerMagic {
-		corrupt()
+		corrupt(file)
 	}
 	n := uint32(len(mm.d) - len(trailerMagic) - 5*4)
 	ix := &Index{data: mm}
+	ix.File = file
 	ix.pathData = ix.uint32(n)
 	ix.nameData = ix.uint32(n + 4)
 	ix.postData = ix.uint32(n + 8)
@@ -110,12 +113,19 @@ func Open(file string) *Index {
 	return ix
 }
 
+func (ix *Index) Close() {
+	if err := syscall.Munmap(ix.data.orig); err != nil {
+		log.Fatalf("munmap: %v", err)
+	}
+	ix.data.f.Close()
+}
+
 // slice returns the slice of index data starting at the given byte offset.
 // If n >= 0, the slice must have length at least n and is truncated to length n.
 func (ix *Index) slice(off uint32, n int) []byte {
 	o := int(off)
 	if uint32(o) != off || n >= 0 && o+n > len(ix.data.d) {
-		corrupt()
+		corrupt(ix.File)
 	}
 	if n < 0 {
 		return ix.data.d[o:]
@@ -132,7 +142,7 @@ func (ix *Index) uint32(off uint32) uint32 {
 func (ix *Index) uvarint(off uint32) uint32 {
 	v, n := binary.Uvarint(ix.slice(off, -1))
 	if n <= 0 {
-		corrupt()
+		corrupt(ix.File)
 	}
 	return uint32(v)
 }
@@ -162,7 +172,7 @@ func (ix *Index) str(off uint32) []byte {
 	str := ix.slice(off, -1)
 	i := bytes.IndexByte(str, '\x00')
 	if i < 0 {
-		corrupt()
+		corrupt(ix.File)
 	}
 	return str[:i]
 }
@@ -245,7 +255,7 @@ func (r *postReader) next() bool {
 		delta64, n := binary.Uvarint(r.d)
 		delta := uint32(delta64)
 		if n <= 0 || delta == 0 {
-			corrupt()
+			corrupt(r.ix.File)
 		}
 		r.d = r.d[n:]
 		r.fileid += delta
@@ -263,7 +273,7 @@ func (r *postReader) next() bool {
 	}
 	// list should end with terminating 0 delta
 	if r.d != nil && (len(r.d) == 0 || r.d[0] != 0) {
-		corrupt()
+		corrupt(r.ix.File)
 	}
 	r.fileid = ^uint32(0)
 	return false
@@ -306,7 +316,7 @@ func (ix *Index) PostingQuery(q *Query) []uint32 {
 // Implements sort.Interface
 type trigramCnt struct {
 	trigram uint32
-	count int
+	count   int
 	listcnt int
 }
 
@@ -323,7 +333,6 @@ func (t trigramCnts) Less(i, j int) bool {
 func (t trigramCnts) Swap(i, j int) {
 	t[i], t[j] = t[j], t[i]
 }
-
 
 func (ix *Index) postingQuery(q *Query, restrict []uint32) (ret []uint32) {
 	var list []uint32
@@ -364,11 +373,11 @@ func (ix *Index) postingQuery(q *Query, restrict []uint32) (ret []uint32) {
 			withCount[idx].listcnt = len(list)
 			if previous > 0 {
 				minIdx := 0.70 * float32(len(withCount))
-				if (previous - len(list)) < 10 && stoppedAt == 0 && float32(idx) > minIdx {
+				if (previous-len(list)) < 10 && stoppedAt == 0 && float32(idx) > minIdx {
 					stoppedAt = len(list)
 				}
 			}
-			if previous > 0 && (previous - len(list)) < 10 {
+			if previous > 0 && (previous-len(list)) < 10 {
 				//fmt.Printf("difference is %d, break!\n", previous - len(list))
 				break
 			}
@@ -421,14 +430,15 @@ func mergeOr(l1, l2 []uint32) []uint32 {
 	return l
 }
 
-func corrupt() {
-	log.Fatal("corrupt index: remove " + File())
+func corrupt(file string) {
+	log.Fatal("corrupt index: remove " + file)
 }
 
 // An mmapData is mmap'ed read-only data from a file.
 type mmapData struct {
-	f *os.File
-	d []byte
+	f    *os.File
+	d    []byte
+	orig []byte
 }
 
 // mmap maps the given file into memory.

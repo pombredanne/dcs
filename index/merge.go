@@ -26,7 +26,7 @@ package index
 // Now merge the posting lists (this is why they begin with the trigram).
 // During the merge, translate the docid numbers to the new C docid space.
 // Also during the merge, write the posting list index to a temporary file as usual.
-// 
+//
 // Copy the name index and posting list index into C's index and write the trailer.
 // Rename C's index onto the new index.
 
@@ -231,6 +231,96 @@ func Merge(dst, src1, src2 string) {
 	os.Remove(w.postIndexFile.name)
 }
 
+// src1 and src2 must not cover the same files. dst will contain an index that
+// contains src1 and src2.
+func Concat(dst, src1, src2 string) {
+	ix1 := Open(src1)
+	ix2 := Open(src2)
+
+	ix3 := bufCreate(dst)
+	ix3.writeString(magic)
+
+	// Merged list of paths.
+	pathData := ix3.offset()
+	ix3.writeString("\x00")
+
+	// Merged list of names.
+	nameData := ix3.offset()
+	nameIndexFile := bufCreate("")
+	for i := 0; i < ix1.numName; i++ {
+		nameIndexFile.writeUint32(ix3.offset() - nameData)
+		ix3.writeString(ix1.Name(uint32(i)))
+		ix3.writeString("\x00")
+	}
+	for i := 0; i < ix2.numName; i++ {
+		nameIndexFile.writeUint32(ix3.offset() - nameData)
+		ix3.writeString(ix2.Name(uint32(i)))
+		ix3.writeString("\x00")
+	}
+
+	nameIndexFile.writeUint32(ix3.offset())
+
+	// Merged list of posting lists.
+	postData := ix3.offset()
+	var r1 postMapReader
+	var r2 postMapReader
+	var w postDataWriter
+
+	w.init(ix3)
+	r1.init(ix1, []idrange{{lo: 0, hi: uint32(ix1.numName), new: 0}})
+	r2.init(ix2, []idrange{{lo: 0, hi: uint32(ix2.numName), new: uint32(ix1.numName)}})
+	for {
+		if r1.trigram < r2.trigram {
+			w.trigram(r1.trigram)
+			for r1.nextId() {
+				w.fileid(r1.fileid)
+			}
+			r1.nextTrigram()
+			w.endTrigram()
+		} else if r2.trigram < r1.trigram {
+			w.trigram(r2.trigram)
+			for r2.nextId() {
+				w.fileid(r2.fileid)
+			}
+			r2.nextTrigram()
+			w.endTrigram()
+		} else {
+			if r1.trigram == ^uint32(0) {
+				break
+			}
+			w.trigram(r1.trigram)
+			for r1.nextId() {
+				w.fileid(r1.fileid)
+			}
+			for r2.nextId() {
+				w.fileid(r2.fileid)
+			}
+			r1.nextTrigram()
+			r2.nextTrigram()
+			w.endTrigram()
+		}
+	}
+
+	// Name index
+	nameIndex := ix3.offset()
+	copyFile(ix3, nameIndexFile)
+
+	// Posting list index
+	postIndex := ix3.offset()
+	copyFile(ix3, w.postIndexFile)
+
+	ix3.writeUint32(pathData)
+	ix3.writeUint32(nameData)
+	ix3.writeUint32(postData)
+	ix3.writeUint32(nameIndex)
+	ix3.writeUint32(postIndex)
+	ix3.writeString(trailerMagic)
+	ix3.flush()
+
+	os.Remove(nameIndexFile.name)
+	os.Remove(w.postIndexFile.name)
+}
+
 type postMapReader struct {
 	ix      *Index
 	idmap   []idrange
@@ -279,7 +369,7 @@ func (r *postMapReader) nextId() bool {
 		delta64, n := binary.Uvarint(r.d)
 		delta := uint32(delta64)
 		if n <= 0 || delta == 0 {
-			corrupt()
+			corrupt(r.ix.File)
 		}
 		r.d = r.d[n:]
 		r.oldid += delta
@@ -299,6 +389,46 @@ func (r *postMapReader) nextId() bool {
 
 	r.fileid = ^uint32(0)
 	return false
+}
+
+// Directly writes the entire posting list to w.
+// Useful to avoid function call overhead, and also expects to be called from
+// ConcatN only (i.e. takes shortcuts that may break usage of idmap other than
+// what ConcatN does).
+func (r *postMapReader) writePostingList(w *postDataWriter) {
+	if r.count == 0 {
+		return
+	}
+
+	// The first entry is fully decoded and re-encoded because w may be in the
+	// middle of a posting list and we need to delta-encode _in relation to_
+	// the last entry.
+	r.count--
+	delta64, n := binary.Uvarint(r.d)
+	delta := uint32(delta64)
+	if n <= 0 || delta == 0 {
+		corrupt(r.ix.File)
+	}
+	r.d = r.d[n:]
+	r.oldid = r.idmap[0].new + ^uint32(0) + delta
+	w.fileid(r.oldid)
+	w.count += r.count
+
+	// If the posting list has only one entry, we’re done now.
+	if r.count == 0 {
+		r.fileid = ^uint32(0)
+		return
+	}
+
+	// TODO: myPostingLast finds the amount of bytes and the last value. In the
+	// long run, we may want to store the last value of a posting list so that
+	// we don’t need to read the entire thing to copy it properly. The overhead
+	// is 2 * sizeof(uint32) * num_posting_lists. calculate that once we have
+	// the entire index.
+	last, totalbytes := myPostingLast(r.d, r.count, r.oldid)
+	w.out.write(r.d[:totalbytes])
+	w.last = uint32(last)
+	r.fileid = ^uint32(0)
 }
 
 type postDataWriter struct {

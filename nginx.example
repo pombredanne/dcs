@@ -1,0 +1,151 @@
+# vim:ts=4:sw=4:expandtab
+
+# Define a custom log format which includes the upstream latency time plus the
+# contents of our own measurement data:
+#
+# 2001:4d88:100e:23:3a60:77ff:feab:d3ea - - [01/Oct/2012:23:03:41 +0200] "GET
+# /search?q=XCreateWindow HTTP/1.1" 200 upstream 188.111.72.14:28080 response
+# 0.756 request 0.756
+#
+log_format upstream '$remote_addr - - [$time_local] "$request" $status '
+    'upstream [$upstream_addr] [$upstream_response_time]=response request $request_time';
+
+proxy_cache_path /var/cache/nginx/cache levels=1:2
+    keys_zone=main:50m
+    max_size=500m inactive=15m;
+
+proxy_temp_path /var/cache/nginx/tmp;
+
+upstream dcsweb {
+    # Keep at least 8 connections to the upstream server(s) open.
+    keepalive 8;
+
+    server localhost:28080;
+}
+
+# Set aside 10MB of RAM to store the req/s for each client IP address.
+# This zone allows an average rate of 1 req/s.
+limit_req_zone $binary_remote_addr zone=one:10m rate=1r/s;
+limit_req_zone $binary_remote_addr zone=legacy:10m rate=1r/s;
+limit_req_zone $binary_remote_addr zone=results:10m rate=3r/s;
+
+server {
+    listen   80;
+    listen   [::]:80 default_server ipv6only=on;
+    listen   443 ssl;
+    listen   [::]:443 ssl ipv6only=on;
+
+    ssl_certificate /etc/ssl/certs/codesearch.debian.net.crt.pem;
+    ssl_certificate_key /etc/ssl/private/codesearch.debian.net.key;
+
+    # See http://cipherli.st/
+    ssl_ciphers ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:ECDH+3DES:DH+3DES:RSA+AES:RSA+3DES:!ADH:!AECDH:!MD5:!DSS;
+    ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    #add_header Strict-Transport-Security "max-age=63072000; includeSubDomains";
+    # https://developer.mozilla.org/en-US/docs/Web/HTTP/X-Frame-Options
+    add_header X-Frame-Options DENY;
+    add_header X-Content-Type-Options nosniff;
+    ssl_stapling on; # Requires nginx >= 1.3.7
+    ssl_stapling_verify on; # Requires nginx => 1.3.7
+    resolver 8.8.8.8 8.8.4.4 valid=300s;
+    resolver_timeout 5s;
+
+    root /usr/share/dcs/static;
+    index index.html index.htm;
+
+    server_name codesearch.debian.net;
+
+    access_log /var/log/nginx/dcs-static.log combined;
+
+    # 5s is a reasonably high timeout for connections, but also still low
+    # enough that users might wait that long for a reply.
+    proxy_connect_timeout 5s;
+
+    # Use Keep-Alive to the upstream backend.
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+    gzip on;
+    gzip_comp_level 6;
+    gzip_types *;
+    gzip_proxied any;
+
+    location /nginx_status {
+        auth_basic off;
+        stub_status on;
+        access_log off;
+        allow 127.0.0.1;
+        deny all;
+    }
+
+    location = /instantws {
+        limit_req zone=one burst=3 nodelay;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        proxy_pass http://dcsweb;
+    }
+
+    location = /track {
+        limit_req zone=results burst=5 nodelay;
+
+        proxy_pass http://dcsweb;
+    }
+
+    location ~ ^/(perpackage-)?results/ {
+        limit_req zone=results burst=5 nodelay;
+
+        set $cache_key $scheme$host$uri$is_args$args$http_accept_encoding;
+        proxy_cache main;
+        proxy_cache_key $cache_key;
+        proxy_cache_valid 1h;
+
+        proxy_pass http://dcsweb;
+    }
+
+    # Server-rendered pages (cached and rate-limited) for legacy clients.
+    location ~ ^/(search|show) {
+        # Limit to 1 req/s on average.
+        limit_req zone=legacy burst=3 nodelay;
+
+        access_log /var/log/nginx/dcs-upstream.log upstream;
+
+        proxy_read_timeout 120s;
+
+        set $cache_key $scheme$host$uri$is_args$args$http_accept_encoding;
+        proxy_cache main;
+        proxy_cache_key $cache_key;
+        proxy_cache_valid 15m;
+
+        proxy_pass http://dcsweb;
+    }
+
+    # Everything else must be a static page, so we directly deliver (with
+    # appropriate caching headers).
+    location /research/ {
+        autoindex on;
+    }
+
+    location / {
+        # Cache static files for 24 hours.
+        expires 24h;
+
+        # First attempt to serve request as file, then
+        # as directory, then fall back to displaying a 404.
+        try_files $uri $uri.html $uri/ /index.html;
+    }
+
+    #error_page 404 /404.html;
+
+    # redirect server error pages to the static page /50x.html
+    error_page 500 502 503 504 /50x.html;
+}

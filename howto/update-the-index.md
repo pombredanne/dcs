@@ -14,13 +14,18 @@ Beware: These steps are untested. Please submit any corrections and/or ask if yo
 Create a PostgreSQL database:
 ```bash
 su - postgres
+createuser dcs
 createdb -O dcs -T template0 -E SQL_ASCII udd
+createdb -E utf8 -O dcs dcs
+psql dcs < schema.sql
 ```
 
 First of all, we need to mirror the Debian archive:
 
 ```bash
 $ cd /dcs
+$ [ -d ~/.gnupg ] || mkdir ~/.gnupg
+$ [ -e ~/.gnupg/trustedkeys.gpg ] || cp /usr/share/keyrings/debian-archive-keyring.gpg ~/.gnupg/trustedkeys.gpg
 $ debmirror --diff=none --progress --verbose -a none --source -s main -h deb-mirror.de -r /debian source-mirror
 $ debmirror --diff=none --exclude-deb-section=.* --include golang-mode --nocleanup --progress --verbose -a none --arch amd64 -s main -h deb-mirror.de -r /debian source-mirror
 ```

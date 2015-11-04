@@ -65,7 +65,7 @@ pre {
 <div id="header">
    <div id="upperheader">
    <div id="logo">
-  <a href="./" title="Debian Home"><img src="./Pics/openlogo-50.png" alt="Debian" width="50" height="61"></a>
+  <a href="./" title="Debian Home"><img src="/Pics/openlogo-50.svg" alt="Debian" width="50" height="61"></a>
   </div> <!-- end logo -->
   <p class="section"><a href="/">Code Search</a></p>
   <div id="searchbox">
@@ -91,20 +91,40 @@ pre {
 
 <h2>Search Results for "{{.q}}"</h2>
 
-<div id="expertbox" style="background: #000; color: #eee; opacity: 0.75; float: right; border-radius: 5px; padding: 1em; display: none">
-{{if .timing}}
-number of regexp results: {{.numfiles}}<br>
-number of source results: {{.numresults}}<br>
-Time to first regexp result: {{.t0}}<br>
-Time to receive and rank: {{.t1}}<br>
-Time to sort: {{.t2}}<br>
-Time to first index result: {{.t3}}<br>
+<p>
+<strong>Filter by package:</strong>
+{{range $index, $package := .packages}}
+<a href="{{$.filterurl}}?q={{$.q}}+package:{{$package}}">{{$package}}</a>,
 {{end}}
-</div>
+</p>
+
+<p>
+<a href="{{.perpkgurl}}">Group results by source package</a>
+</p>
+
+<p>
+{{.pagination}}
+</p>
 
 <ul id="results">
 {{range .results}}
-<li><a href="/show?file={{.SourcePackage}}{{.RelativePath}}&line={{.Line}}&numfiles={{$.numfiles}}#L{{.Line}}"><code><strong>{{.SourcePackage}}</strong>{{.RelativePath}}</code>:{{.Line}}</a><br>
-<code>{{.Context}}</code><br>
-PathRank: {{.PathRanking}}, Rank: {{.Ranking}}, Final: {{.FinalRanking}}</li>
+<li><a href="/show?file={{.Path}}&line={{.Line}}#L{{.Line}}"><code><strong>{{.SourcePackage}}</strong>{{.RelativePath}}</code>:{{.Line}}</a><br>
+<pre>
+{{.Context}}
+</pre>
+
+PathRank: {{.PathRank}}, Rank: {{.Ranking}}</li>
 {{end}}
+</ul>
+<p>
+{{.pagination}}
+</p>
+<script type="text/javascript">
+<!--
+if (location.pathname.substr(0, '/search'.length) === '/search') {
+    window.location.replace('/results/{{.q_escaped}}/page_{{.page}}');
+}
+-->
+</script>
+
+{{ template "footer.html" }}
