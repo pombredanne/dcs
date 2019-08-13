@@ -6,23 +6,50 @@ package common
 import (
 	"flag"
 	"html/template"
+	"io/ioutil"
 	"log"
+	"path/filepath"
 	"reflect"
+	"strings"
+
+	"github.com/Debian/dcs/grpcutil"
+	"github.com/Debian/dcs/proto"
 )
 
 var Version string = "unknown"
+var CriticalCss template.CSS
 var templatePattern = flag.String("template_pattern",
 	"templates/*",
 	"Pattern matching the HTML templates (./templates/* by default)")
-var SourceBackends = flag.String("source_backends",
+var sourceBackends = flag.String("source_backends",
 	"localhost:28082",
 	"host:port (multiple values are comma-separated) of the source-backend(s)")
+var SourceBackendStubs []proto.SourceBackendClient
 var UseSourcesDebianNet = flag.Bool("use_sources_debian_net",
 	false,
 	"Redirect to sources.debian.net instead of handling /show on our own.")
 var Templates *template.Template
 
-func LoadTemplates() {
+// Must be called after flag.Parse()
+func Init(tlsCertPath, tlsKeyPath, staticPath string) {
+	loadTemplates()
+	b, err := ioutil.ReadFile(filepath.Join(staticPath, "critical.min.css"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	CriticalCss = template.CSS(string(b))
+	addrs := strings.Split(*sourceBackends, ",")
+	SourceBackendStubs = make([]proto.SourceBackendClient, len(addrs))
+	for idx, addr := range addrs {
+		conn, err := grpcutil.DialTLS(addr, tlsCertPath, tlsKeyPath)
+		if err != nil {
+			log.Fatalf("could not connect to %q: %v", addr, err)
+		}
+		SourceBackendStubs[idx] = proto.NewSourceBackendClient(conn)
+	}
+}
+
+func loadTemplates() {
 	var err error
 	Templates = template.New("foo").Funcs(template.FuncMap{
 		"eq": func(args ...interface{}) bool {

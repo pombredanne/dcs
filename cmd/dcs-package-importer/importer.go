@@ -20,9 +20,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/Debian/dcs/goroutinez"
+	"github.com/Debian/dcs/grpcutil"
 	"github.com/Debian/dcs/index"
+	"github.com/Debian/dcs/proto"
 	_ "github.com/Debian/dcs/varz"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/net/context"
+	_ "golang.org/x/net/trace"
 )
 
 var (
@@ -37,6 +41,10 @@ var (
 	cpuProfile = flag.String("cpuprofile",
 		"",
 		"write cpu profile to this file")
+
+	debugSkip = flag.Bool("debug_skip",
+		false,
+		"Print log messages when files are skipped")
 
 	tmpdir string
 
@@ -90,6 +98,11 @@ var (
 			Name: "index_files",
 			Help: "Number of files in the index.",
 		})
+
+	tlsCertPath = flag.String("tls_cert_path", "", "Path to a .pem file containing the TLS certificate.")
+	tlsKeyPath  = flag.String("tls_key_path", "", "Path to a .pem file containing the TLS private key.")
+
+	indexBackend proto.IndexBackendClient
 )
 
 func init() {
@@ -266,7 +279,7 @@ func mergeToShard() {
 	filesInIndex.Set(float64(len(indexFiles)))
 
 	log.Printf("Got %d index files\n", len(indexFiles))
-	if len(indexFiles) == 1 {
+	if len(indexFiles) < 2 {
 		return
 	}
 	tmpIndexPath, err := ioutil.TempFile(*unpackedPath, "newshard")
@@ -310,15 +323,8 @@ func mergeToShard() {
 	successfulMerges.Inc()
 
 	// Replace the current index with the newly created index.
-	resp, err := http.Get(fmt.Sprintf("http://localhost:28081/replace?shard=%s", filepath.Base(tmpIndexPath.Name())))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		log.Fatalf("dcs-index-backend /replace response: %+v (body: %s)\n", resp, body)
+	if _, err := indexBackend.ReplaceIndex(context.Background(), &proto.ReplaceIndexRequest{ReplacementPath: filepath.Base(tmpIndexPath.Name())}); err != nil {
+		log.Fatalf("dcs-index-backend ReplaceIndex failed: %v", err)
 	}
 }
 
@@ -341,13 +347,16 @@ func indexPackage(pkg string) {
 		func(path string, info os.FileInfo, err error) error {
 			if dir, filename := filepath.Split(path); filename != "" {
 				skip := ignored(info, dir, filename)
-				if skip && info.IsDir() {
+				if *debugSkip && skip != nil {
+					log.Printf("Skipping %q: %v", path, skip)
+				}
+				if skip != nil && info.IsDir() {
 					if err := os.RemoveAll(path); err != nil {
 						log.Fatalf("Could not remove directory %q: %v\n", path, err)
 					}
 					return filepath.SkipDir
 				}
-				if skip && !info.IsDir() {
+				if skip != nil && !info.IsDir() {
 					if err := os.Remove(path); err != nil {
 						log.Fatalf("Could not remove file %q: %v\n", path, err)
 					}
@@ -369,6 +378,7 @@ func indexPackage(pkg string) {
 			}
 
 			if err := index.AddFile(path, path[stripLen:]); err != nil {
+				log.Printf("Could not index %q: %v\n", path, err)
 				if err := os.Remove(path); err != nil {
 					log.Fatalf("Could not remove file %q: %v\n", path, err)
 				}
@@ -404,6 +414,42 @@ func indexPackage(pkg string) {
 	successfulPackageIndexes.Inc()
 }
 
+func unpack(dscPath, unpacked string) error {
+	cmd := exec.Command("dpkg-source", "--no-copy", "--no-check", "-x",
+		dscPath, unpacked)
+	// Just display dpkg-source’s stderr in our process’s stderr.
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	files, err := ioutil.ReadDir(unpacked)
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		if !file.Mode().IsRegular() {
+			continue
+		}
+		if strings.Contains(file.Name(), ".tar.") {
+			// shell out to tar so that we don’t need to deal with the various
+			// compression formats
+			cmd := exec.Command("tar", "xf", file.Name())
+			cmd.Dir = unpacked
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return err
+			}
+			// The tarball will be discarded later, but we might as well remove
+			// it now to speed things up.
+			os.Remove(filepath.Join(unpacked, file.Name()))
+		}
+	}
+
+	return nil
+}
+
 // This goroutine reads package names from the indexQueue channel, unpacks the
 // package, deletes all unnecessary files and indexes it.
 // By default, the number of simultaneous goroutines running this function is
@@ -420,11 +466,7 @@ func unpackAndIndex() {
 			log.Printf("removing unpacked dir: %v\n", err)
 		}
 
-		cmd := exec.Command("dpkg-source", "--no-copy", "--no-check", "-x",
-			filepath.Join(tmpdir, dscPath), unpacked)
-		// Just display dpkg-source’s stderr in our process’s stderr.
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := unpack(filepath.Join(tmpdir, dscPath), unpacked); err != nil {
 			log.Printf("Skipping package %s: %v\n", pkg, err)
 			failedDpkgSourceExtracts.Inc()
 			continue
@@ -441,6 +483,10 @@ func main() {
 
 	// Allow as many concurrent unpackAndIndex goroutines as we have cores.
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	if err := os.MkdirAll(*unpackedPath, 0755); err != nil {
+		log.Fatal(err)
+	}
 
 	setupFilters()
 
@@ -462,6 +508,13 @@ func main() {
 			mergeToShard()
 		}
 	}()
+
+	conn, err := grpcutil.DialTLS("localhost:28081", *tlsCertPath, *tlsKeyPath)
+	if err != nil {
+		log.Fatalf("could not connect to %q: %v", "localhost:28081", err)
+	}
+	defer conn.Close()
+	indexBackend = proto.NewIndexBackendClient(conn)
 
 	http.HandleFunc("/import/", importPackage)
 	http.HandleFunc("/merge", mergeOrError)

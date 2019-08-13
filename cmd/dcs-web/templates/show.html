@@ -4,7 +4,7 @@ vim:ts=4:sw=4:expandtab
 <html lang="en">
 <head>
 <title>Debian Code Search: {{.filename}}</title>
-<link rel="stylesheet" href="debcodesearch.css">
+<link rel="stylesheet" href="debcodesearch.min.css">
 <style type="text/css">
 pre, code {
     /* We need to make sure that the line numbers and the code itself have
@@ -23,8 +23,8 @@ pre, code {
     width: {{.lnrwidth}}em;
 }
 </style>
-<link rel="stylesheet" href="http://yandex.st/highlightjs/7.0/styles/default.min.css">
-<script src="http://yandex.st/highlightjs/7.0/highlight.min.js"></script>
+<link rel="stylesheet" href="//yandex.st/highlightjs/7.0/styles/default.min.css">
+<script src="//yandex.st/highlightjs/7.0/highlight.min.js"></script>
 </head>
 <body>
 
@@ -61,4 +61,4 @@ pre, code {
 </code></pre>
 
 <script>hljs.initHighlightingOnLoad();</script>
-{{ template "footer.html" }}
+{{ template "footer.html" . }}

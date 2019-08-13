@@ -6,12 +6,13 @@
 package health
 
 import (
-	"github.com/Debian/dcs/cmd/dcs-web/common"
 	"encoding/json"
 	"log"
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/Debian/dcs/cmd/dcs-web/common"
 )
 
 var status = make(chan healthRequest)
@@ -33,9 +34,9 @@ func periodically(checkFunc func() healthUpdate, updates chan healthUpdate) {
 	}
 }
 
-// health-checks sources.debian.net, run within a goroutine
+// health-checks sources.debian.org, run within a goroutine
 func checkSDN() (update healthUpdate) {
-	update.service = "sources.debian.net"
+	update.service = "sources.debian.org"
 
 	client := &http.Client{
 		Transport: &http.Transport{
@@ -52,7 +53,7 @@ func checkSDN() (update healthUpdate) {
 		},
 	}
 
-	req, err := http.NewRequest("GET", "http://sources.debian.net/api/ping/", nil)
+	req, err := http.NewRequest("GET", "https://sources.debian.org/api/ping/", nil)
 	if err != nil {
 		log.Printf("health check: could not create request: %v\n", err)
 		return
@@ -61,12 +62,12 @@ func checkSDN() (update healthUpdate) {
 	req.Close = true
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("health check: sources.debian.net did not answer to HTTP\n")
+		log.Printf("health check: sources.debian.org did not answer to HTTP\n")
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Printf("health check: sources.debian.net returned code %d\n", resp.StatusCode)
+		log.Printf("health check: sources.debian.org returned code %d\n", resp.StatusCode)
 		return
 	}
 	type sdnStatus struct {
@@ -75,11 +76,11 @@ func checkSDN() (update healthUpdate) {
 	status := sdnStatus{}
 	decoder := json.NewDecoder(resp.Body)
 	if err := decoder.Decode(&status); err != nil {
-		log.Printf("health check: sources.debian.net returned invalid JSON: %v\n", err)
+		log.Printf("health check: sources.debian.org returned invalid JSON: %v\n", err)
 		return
 	}
 	if status.Status != "ok" {
-		log.Printf("health check: sources.debian.net returned status == false\n")
+		log.Printf("health check: sources.debian.org returned status == false\n")
 		return
 	}
 	update.healthy = true

@@ -19,7 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"code.google.com/p/go.net/websocket"
 	"github.com/Debian/dcs/cmd/dcs-web/common"
 	"github.com/Debian/dcs/cmd/dcs-web/health"
 	"github.com/Debian/dcs/cmd/dcs-web/search"
@@ -28,13 +27,22 @@ import (
 	"github.com/Debian/dcs/index"
 	dcsregexp "github.com/Debian/dcs/regexp"
 	_ "github.com/Debian/dcs/varz"
+	"github.com/opentracing-contrib/go-stdlib/nethttp"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/uber/jaeger-client-go"
+	jaegercfg "github.com/uber/jaeger-client-go/config"
+	_ "golang.org/x/net/trace"
+	"golang.org/x/net/websocket"
 )
 
 var (
 	listenAddress = flag.String("listen_address",
 		":28080",
 		"listen address ([host]:port)")
+	listenAddressTLS = flag.String("listen_address_tls",
+		"",
+		"listen address ([host]:port) for TLS")
 	memprofile = flag.String("memprofile", "", "Write memory profile to this file")
 	staticPath = flag.String("static_path",
 		"./static/",
@@ -42,11 +50,17 @@ var (
 	accessLogPath = flag.String("access_log_path",
 		"",
 		"Where to write access.log entries (in Apache Common Log Format). Disabled if empty.")
+	tlsCertPath = flag.String("tls_cert_path", "", "Path to a .pem file containing the TLS certificate.")
+	tlsKeyPath  = flag.String("tls_key_path", "", "Path to a .pem file containing the TLS private key.")
+	jaegerAgent = flag.String("jaeger_agent",
+		"localhost:5775",
+		"host:port of a github.com/uber/jaeger agent")
 
 	accessLog *os.File
 
 	resultsPathRe  = regexp.MustCompile(`^/results/([^/]+)/(perpackage_` + strconv.Itoa(resultsPerPackage) + `_)?page_([0-9]+).json$`)
-	packagesPathRe = regexp.MustCompile(`^/results/([^/]+)/packages.json$`)
+	packagesPathRe = regexp.MustCompile(`^/results/([^/]+)/packages.(json|txt)$`)
+	redirectPathRe = regexp.MustCompile(`^/(?:perpackage-)?results/([^/]+)(?:/[0-9]+)?/page_([0-9]+)`)
 
 	activeQueries = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -87,7 +101,105 @@ func validateQuery(query string) error {
 	return nil
 }
 
+func EventsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	query := r.FormValue("q")
+	if query == "" {
+		query = strings.TrimPrefix(r.URL.Path, "/events/")
+	}
+	span := opentracing.SpanFromContext(ctx)
+	span.SetOperationName("Events: " + query)
+	w.Header().Set("Content-Type", "text/event-stream")
+
+	// The additional ":" at the end is necessary so that we don’t need to
+	// distinguish between the two cases (X-Forwarded-For, without a port, and
+	// RemoteAddr, with a part) in the code below.
+	src := r.Header.Get("X-Forwarded-For") + ":"
+	if src == ":" || (!strings.HasPrefix(r.RemoteAddr, "[::1]:") &&
+		!strings.HasPrefix(r.RemoteAddr, "127.0.0.1:")) {
+		src = r.RemoteAddr
+	}
+	q := "q=" + url.QueryEscape(query)
+
+	log.Printf("[%s] (events) Received query %q\n", src, q)
+	if err := validateQuery("?" + q); err != nil {
+		log.Printf("[%s] Query %q failed validation: %v\n", src, q, err)
+		b, _ := json.Marshal(struct {
+			Type         string
+			ErrorType    string
+			ErrorMessage string
+		}{
+			Type:         "error",
+			ErrorType:    "invalidquery",
+			ErrorMessage: err.Error(),
+		})
+		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", 0, string(b)); err != nil {
+			log.Printf("[%s] aborting, could not write: %v\n", src, err)
+			return
+		}
+		return
+	}
+
+	// Uniquely (well, good enough) identify this query for a couple of minutes
+	// (as long as we want to cache results). We could try to normalize the
+	// query before hashing it, but that seems hardly worth the complexity.
+	h := fnv.New64()
+	io.WriteString(h, q)
+	identifier := fmt.Sprintf("%x", h.Sum64())
+
+	cached, err := maybeStartQuery(ctx, identifier, src, q)
+	if err != nil {
+		log.Printf("[%s] could not start query: %v\n", src, err)
+		http.Error(w, "Could not start query", http.StatusInternalServerError)
+		return
+	}
+
+	// Create an apache common log format entry.
+	if accessLog != nil {
+		responseCode := 200
+		if cached {
+			responseCode = 304
+		}
+		remoteIP := src
+		if idx := strings.LastIndex(remoteIP, ":"); idx > -1 {
+			remoteIP = remoteIP[:idx]
+		}
+		fmt.Fprintf(accessLog, "%s - - [%s] \"GET /events/%s HTTP/1.1\" %d -\n",
+			remoteIP, time.Now().Format("02/Jan/2006:15:04:05 -0700"), q, responseCode)
+	}
+
+	// TODO: use Last-Event-ID header
+	lastseen := -1
+	sent := 0
+	for {
+		message, sequence := getEvent(identifier, lastseen)
+		lastseen = sequence
+		// This message was obsoleted by a more recent one, e.g. a more
+		// recent progress update obsoletes all earlier progress updates.
+		if *message.obsolete {
+			continue
+		}
+		if len(message.data) == 0 {
+			break
+		}
+		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", sequence, message.data); err != nil {
+			log.Printf("[%s] aborting, could not write: %v\n", src, err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		sent++
+	}
+
+	if sent == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		fmt.Fprintln(w, "No content")
+	}
+}
+
 func InstantServer(ws *websocket.Conn) {
+	ctx := ws.Request().Context()
 	// The additional ":" at the end is necessary so that we don’t need to
 	// distinguish between the two cases (X-Forwarded-For, without a port, and
 	// RemoteAddr, with a part) in the code below.
@@ -110,6 +222,10 @@ func InstantServer(ws *websocket.Conn) {
 			return
 		}
 		log.Printf("[%s] Received query %v\n", src, q)
+
+		// span := opentracing.SpanFromContext(ctx)
+		// span.SetOperationName("Websocket: " + q.Query)
+
 		if err := validateQuery("?" + q.Query); err != nil {
 			log.Printf("[%s] Query %q failed validation: %v\n", src, q.Query, err)
 			ws.Write([]byte(`{"Type":"error", "ErrorType":"invalidquery"}`))
@@ -123,7 +239,12 @@ func InstantServer(ws *websocket.Conn) {
 		io.WriteString(h, q.Query)
 		identifier := fmt.Sprintf("%x", h.Sum64())
 
-		cached := maybeStartQuery(identifier, src, q.Query)
+		cached, err := maybeStartQuery(ctx, identifier, src, q.Query)
+		if err != nil {
+			log.Printf("[%s] could not start query: %v\n", src, err)
+			ws.Write([]byte(`{"Type":"error", "ErrorType":"failed"}`))
+			continue
+		}
 
 		// Create an apache common log format entry.
 		if accessLog != nil {
@@ -169,19 +290,23 @@ func InstantServer(ws *websocket.Conn) {
 func ResultsHandler(w http.ResponseWriter, r *http.Request) {
 	// TODO: ideally, this would also start the search in the background to avoid waiting for the round-trip to the client.
 
-	// TODO: also, what about non-javascript clients?
-
 	// Try to match /page_n.json or /perpackage_2_page_n.json
 	matches := resultsPathRe.FindStringSubmatch(r.URL.Path)
 	log.Printf("matches for %q = %v\n", r.URL.Path, matches)
 	if matches == nil || len(matches) != 4 {
 		// See whether it’s /packages.json, then.
 		matches = packagesPathRe.FindStringSubmatch(r.URL.Path)
-		if matches == nil || len(matches) != 2 {
-			// While this just serves index.html, the javascript part of index.html
-			// realizes the path starts with /results/ and starts the search, then
-			// requests the specified page on search completion.
-			http.ServeFile(w, r, filepath.Join(*staticPath, "index.html"))
+		if matches == nil || len(matches) != 3 {
+			matches = redirectPathRe.FindStringSubmatch(r.URL.Path)
+			if len(matches) < 3 {
+				http.Error(w, "Bad request", http.StatusBadRequest)
+				return
+			}
+			pageSuffix := "&page=" + matches[2]
+			if matches[2] == "0" {
+				pageSuffix = ""
+			}
+			http.Redirect(w, r, "/search?q="+matches[1]+pageSuffix, http.StatusFound)
 			return
 		}
 
@@ -192,12 +317,21 @@ func ResultsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		startJsonResponse(w)
+		if matches[2] == "json" {
+			startJsonResponse(w)
+		}
 
 		packages := state[queryid].allPackagesSorted
 
-		if err := json.NewEncoder(w).Encode(struct{ Packages []string }{packages}); err != nil {
-			http.Error(w, fmt.Sprintf("Could not encode packages: %v", err), http.StatusInternalServerError)
+		switch matches[2] {
+		case "json":
+			if err := json.NewEncoder(w).Encode(struct{ Packages []string }{packages}); err != nil {
+				http.Error(w, fmt.Sprintf("Could not encode packages: %v", err), http.StatusInternalServerError)
+			}
+		case "txt":
+			if _, err := w.Write([]byte(strings.Join(packages, "\n") + "\n")); err != nil {
+				http.Error(w, fmt.Sprintf("Could not write packages: %v", err), http.StatusInternalServerError)
+			}
 		}
 		return
 	}
@@ -205,7 +339,7 @@ func ResultsHandler(w http.ResponseWriter, r *http.Request) {
 	queryid := matches[1]
 	page, err := strconv.Atoi(matches[3])
 	if err != nil {
-		log.Fatal("Could not convert %q into a number: %v\n", matches[2], err)
+		log.Fatalf("Could not convert %q into a number: %v\n", matches[3], err)
 	}
 	perpackage := (matches[2] == "perpackage_2_")
 	_, ok := state[queryid]
@@ -225,9 +359,32 @@ func ResultsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	flag.Parse()
 
-	common.LoadTemplates()
+	// Initialize the global tracer as early as possible:
+	// common.Init uses gRPC.
+	cfg := jaegercfg.Configuration{
+		Sampler: &jaegercfg.SamplerConfig{
+			Type:  "const",
+			Param: 1,
+		},
+		Reporter: &jaegercfg.ReporterConfig{
+			BufferFlushInterval: 1 * time.Second,
+			LocalAgentHostPort:  *jaegerAgent,
+		},
+	}
+	tracer, closer, err := cfg.New(
+		"dcs-web",
+		jaegercfg.Logger(jaeger.StdLogger),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	opentracing.SetGlobalTracer(tracer)
+	defer closer.Close()
+
+	common.Init(*tlsCertPath, *tlsKeyPath, *staticPath)
 
 	if *accessLogPath != "" {
 		var err error
@@ -245,13 +402,16 @@ func main() {
 		}
 	}
 
-	fmt.Println("Debian Code Search webapp")
+	fmt.Printf("Debian Code Search webapp, version %s\n", common.Version)
 
 	health.StartChecking()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Check if a static file was requested with full name
 		name := filepath.Join(*staticPath, r.URL.Path)
+		if r.URL.Path == "/" {
+			name = filepath.Join(*staticPath, "index.html")
+		}
 		if _, err := os.Stat(name); err == nil {
 			http.ServeFile(w, r, name)
 			return
@@ -264,11 +424,16 @@ func main() {
 			return
 		}
 
-		http.ServeFile(w, r, filepath.Join(*staticPath, "index.html"))
+		if err := common.Templates.ExecuteTemplate(w, "index.html", map[string]interface{}{
+			"criticalcss": common.CriticalCss,
+			"version":     common.Version,
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	})
 	http.HandleFunc("/favicon.ico", http.NotFound)
 	http.HandleFunc("/goroutinez", goroutinez.Goroutinez)
-	http.HandleFunc("/search", Search)
 	http.HandleFunc("/show", show.Show)
 	http.HandleFunc("/memprof", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("writing memprof")
@@ -288,8 +453,35 @@ func main() {
 	http.HandleFunc("/queryz", QueryzHandler)
 	http.HandleFunc("/track", Track)
 
+	traced := http.NewServeMux()
+	traced.HandleFunc("/search", Search)
+	traced.HandleFunc("/events/", EventsHandler)
+	traced.Handle("/instantws", websocket.Handler(InstantServer))
+	traceHandler := nethttp.Middleware(tracer, traced)
+	http.Handle("/events/", traceHandler)
+	// TODO: find a way to trace /instantws calls — re-implement the
+	// http.Hijacker interface in nethttp.Middleware?
+	// http.Handle("/instantws", traceHandler)
 	http.Handle("/instantws", websocket.Handler(InstantServer))
+	http.Handle("/search", traceHandler)
+
+	// Used by the service worker.
+	http.HandleFunc("/placeholder.html", func(w http.ResponseWriter, r *http.Request) {
+		if err := common.Templates.ExecuteTemplate(w, "placeholder.html", map[string]interface{}{
+			"criticalcss": common.CriticalCss,
+			"version":     common.Version,
+			"q":           "%q%",
+			"q_escaped":   "%q_escaped%",
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	})
+
 	http.Handle("/metrics", prometheus.Handler())
 
+	if *listenAddressTLS != "" {
+		go log.Fatal(http.ListenAndServeTLS(*listenAddressTLS, *tlsCertPath, *tlsKeyPath, nil))
+	}
 	log.Fatal(http.ListenAndServe(*listenAddress, nil))
 }
